@@ -64,8 +64,6 @@ data/
 You can find details about the `cameras`, `bounding boxes`, and `images` in docs/data-format.md. For `skel_2d` and `skel_3d`, you can generate them automatically using the provided `preprocess.py` script. Alternatively, we have also uploaded preprocessed data [here](https://huggingface.co/datasets/tijiang13/FIFA-Skeletal-Tracking-Light-2026/tree/main).
 
 ### 📺 Sample Visualization
-We have integrated basic visualization functions in the code, but you are also encourage to checkout the visualization script we provided in [WorldPose Dataset](https://github.com/eth-ait/WorldPoseDataset/tree/visualization)
-
 We provide sample visualization of prediction of this baseline implementation in [media folder](media/), it showcases the predicted cameras as well as 3D skels (we rendered the meshes instead 3D skels in the samples).
 
 | ARG_CRO_225412 | MOR_POR_193202 | NET_ARG_004041 |
@@ -80,6 +78,37 @@ To run the baseline model on the dataset, simply execute:
 bash ./scripts/run_jobs.sh
 # then you can submit submission_val and submission_test to validation and test portal, respectively.
 ```
+
+## Visualizing and Debugging your Results
+
+We provide a visualization script ([`visualize.py`](visualize.py)) built on [aitviewer](https://github.com/eth-ait/aitviewer) to inspect your pipeline outputs in 3D. It renders the calibrated camera, video billboard, bounding boxes, and predicted 3D skeletons together.
+
+**Prerequisites**: Install aitviewer:
+```bash
+pip install aitviewer
+```
+
+**Step 1**: Run the pipeline with camera export enabled:
+```bash
+python main.py -s data/sequences_val.txt -o outputs/submission_full.npz -c
+```
+This saves per-frame calibrated cameras to `outputs/calibration/` and predictions to the output NPZ.
+
+**Step 2**: Visualize a sequence:
+```bash
+# Interactive viewer
+python visualize.py --sequence ARG_FRA_183303 -p outputs/submission_full.npz
+
+# Headless rendering to video
+python visualize.py --sequence ARG_FRA_183303 -p outputs/submission_full.npz --headless
+```
+
+**CLI options**:
+- `--sequence` — sequence name to visualize (default: `ARG_FRA_183303`)
+- `--predictions` / `-p` — path to the output predictions NPZ file (default: `outputs/submission_full.npz`)
+- `--calibration_dir` — directory with calibrated camera files (default: `outputs/calibration/`)
+- `--headless` — render to video instead of opening the interactive viewer
+- `--output_path` — output directory for headless video rendering (default: `outputs/result_vis`)
 
 ## 📌 Notes
 - This is a **baseline** — you are encouraged to improve the accuracy by refining camera estimation, leveraging better keypoint tracking, or integrating deep learning approaches.
