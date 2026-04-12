@@ -17,6 +17,10 @@ from lib.postprocess import smoothen
 
 OPENPOSE_TO_OURS = [0, 2, 5, 3, 6, 4, 7, 9, 12, 10, 13, 11, 14, 22, 19]
 
+# Indices of foot keypoints in our 15-keypoint format:
+# 11=RAnkle, 12=LAnkle, 13=RBigToe, 14=LBigToe
+FOOT_INDICES = [11, 12, 13, 14]
+
 
 def intersection_over_plane(o, d):
     """
@@ -110,36 +114,35 @@ def project_points_th(obj_pts, R, C, K, k):
     return img_pts
 
 
-def minimize_reprojection_error(pts_3d, pts_2d, R, C, K, k, iterations=10):
+def minimize_reprojection_error(pts_3d, pts_2d, R, C, K, k, group_ids, n_groups, iterations=10):
     """
-    Optimize 3D points to minimize reprojection error.
+    Optimize per-(person, frame) translation to minimize reprojection error across all joints.
 
     args:
-        pts_3d: (N, 3)  - Initial 3D points (learnable)
-        pts_2d: (N, 2)  - Corresponding 2D points
-        R: (N, 3, 3)    - Rotation matrix (fixed)
-        C: (N, 3)       - Camera center (fixed)
-        K: (N, 3, 3)    - Camera intrinsic matrix (fixed)
-        k: (N, 2,)      - Distortion coefficients (fixed)
-        iterations: int - Number of optimization steps
+        pts_3d: (P, 3)    - 3D joint positions (P = total valid joint samples across all groups)
+        pts_2d: (P, 2)    - Corresponding 2D observations
+        R: (P, 3, 3)      - Rotation matrix per sample (fixed)
+        C: (P, 3)         - Camera center per sample (fixed)
+        K: (P, 3, 3)      - Camera intrinsic matrix per sample (fixed)
+        k: (P, 2)         - Distortion coefficients per sample (fixed)
+        group_ids: (P,)   - Which (person, frame) group each sample belongs to [0, n_groups)
+        n_groups: int     - Number of (person, frame) groups (= number of valid person/frame pairs)
+        iterations: int   - Number of optimization steps
 
     returns:
-        t: (N, 3) - Optimized translation
+        t: (n_groups, 3) - Optimized translation per (person, frame) group
     """
-    # Convert 3D points to learnable parameters
-    # pts_3d = torch.nn.Parameter(pts_3d.clone().detach().requires_grad_(True))
-    t = torch.nn.Parameter(torch.zeros_like(pts_3d).clone().detach().requires_grad_(True))
+    t = torch.nn.Parameter(torch.zeros(n_groups, 3, dtype=pts_3d.dtype, device=pts_3d.device).requires_grad_(True))
     offset = torch.tensor([3, 3, 0.2], dtype=pts_3d.dtype, device=pts_3d.device)
-    lower_bounds = t - offset
-    upper_bounds = t + offset
 
-    # check if there are any NaN values
     assert not torch.isnan(pts_3d).any()
     assert not torch.isnan(pts_2d).any()
 
     def closure():
         optimizer.zero_grad()
-        projected_pts = project_points_th(pts_3d + t, R, C, K, k)
+        # broadcast each group's translation to all of its joint samples
+        t_per_sample = t[group_ids]  # (P, 3)
+        projected_pts = project_points_th(pts_3d + t_per_sample, R, C, K, k)
         loss = torch.nn.functional.mse_loss(projected_pts, pts_2d)
         loss.backward()
         return loss
@@ -148,35 +151,58 @@ def minimize_reprojection_error(pts_3d, pts_2d, R, C, K, k, iterations=10):
     for _ in range(iterations):
         optimizer.step(closure)
         with torch.no_grad():
-            t.copy_(torch.clamp(t, lower_bounds, upper_bounds))
+            t.copy_(torch.clamp(t, -offset, offset))
 
     return t.detach()
 
 
 def fine_tune_translation(predictions, skels_2d, cameras, Rt, boxes):
-    """wrapper function to fine-tune the translation of the 3D predictions to minimize reprojection error"""
-    NUM_PERSONS = predictions.shape[0]
-    mid_hip_3d = predictions[..., [7, 8], :].mean(axis=-2, keepdims=False)
-    mid_hip_2d = skels_2d[..., [7, 8], :].mean(axis=-2, keepdims=False).transpose(1, 0, 2)
+    """Fine-tune per-(person, frame) translation by minimizing reprojection error across all valid joints."""
+    NUM_PERSONS, NUM_FRAMES = predictions.shape[:2]
 
-    R = np.array([k[0] for k in Rt])
-    t = np.array([k[1] for k in Rt])
-    C = (-t[:, None] @ R).squeeze(1)
+    R_arr = np.array([k[0] for k in Rt])   # (NUM_FRAMES, 3, 3)
+    t_arr = np.array([k[1] for k in Rt])   # (NUM_FRAMES, 3)
+    C_arr = (-t_arr[:, None] @ R_arr).squeeze(1)  # (NUM_FRAMES, 3)
 
-    camera_params = {
-        "K": cameras["K"][None].repeat(NUM_PERSONS, axis=0),
-        "R": R[None].repeat(NUM_PERSONS, axis=0),
-        "C": C[None].repeat(NUM_PERSONS, axis=0),
-        "k": cameras["k"][None, ..., :2].repeat(NUM_PERSONS, axis=0),
-    }
+    # valid: (NUM_PERSONS, NUM_FRAMES) — pairs where a bounding box exists
     valid = ~np.isnan(boxes).any(axis=-1).transpose(1, 0)
+
+    # skels_2d is (NUM_FRAMES, NUM_PERSONS, 15, 2) — transpose to (NUM_PERSONS, NUM_FRAMES, 15, 2)
+    skels_2d_pf = skels_2d.transpose(1, 0, 2, 3)
+
+    # For each valid (person, frame) pair, gather all joints that have non-NaN 2D observations
+    kps_3d_all = predictions[valid]   # (M, 15, 3)
+    kps_2d_all = skels_2d_pf[valid]   # (M, 15, 2)
+
+    valid_persons, valid_frames = np.where(valid)  # (M,)
+    M = len(valid_persons)
+
+    # valid_joints[m, j] = True if joint j is usable for pair m
+    valid_joints = (
+        ~np.isnan(kps_2d_all).any(axis=-1) &
+        ~np.isnan(kps_3d_all).any(axis=-1)
+    )  # (M, 15)
+
+    pair_ids, joint_ids = np.where(valid_joints)  # (P,) each — index into the M valid pairs
+
+    pts_3d = kps_3d_all[pair_ids, joint_ids]          # (P, 3)
+    pts_2d = kps_2d_all[pair_ids, joint_ids]           # (P, 2)
+    frame_ids = valid_frames[pair_ids]                 # (P,) — frame index for each sample
+
+    cam_R = R_arr[frame_ids]                           # (P, 3, 3)
+    cam_C = C_arr[frame_ids]                           # (P, 3)
+    cam_K = cameras["K"][frame_ids]                    # (P, 3, 3)
+    cam_k = cameras["k"][frame_ids, :2]                # (P, 2)
+
     traj_3d = minimize_reprojection_error(
-        pts_3d=torch.tensor(mid_hip_3d[valid], dtype=torch.float32).to("cuda"),
-        pts_2d=torch.tensor(mid_hip_2d[valid], dtype=torch.float32).to("cuda"),
-        R=torch.tensor(camera_params["R"][valid], dtype=torch.float32).to("cuda"),
-        C=torch.tensor(camera_params["C"][valid], dtype=torch.float32).to("cuda"),
-        K=torch.tensor(camera_params["K"][valid], dtype=torch.float32).to("cuda"),
-        k=torch.tensor(camera_params["k"][valid], dtype=torch.float32).to("cuda"),
+        pts_3d=torch.tensor(pts_3d, dtype=torch.float32).to("cuda"),
+        pts_2d=torch.tensor(pts_2d, dtype=torch.float32).to("cuda"),
+        R=torch.tensor(cam_R, dtype=torch.float32).to("cuda"),
+        C=torch.tensor(cam_C, dtype=torch.float32).to("cuda"),
+        K=torch.tensor(cam_K, dtype=torch.float32).to("cuda"),
+        k=torch.tensor(cam_k, dtype=torch.float32).to("cuda"),
+        group_ids=torch.tensor(pair_ids, dtype=torch.long).to("cuda"),
+        n_groups=M,
     )
     return traj_3d, valid
 
@@ -238,7 +264,14 @@ def process_sequence(
 
             skel_2d = skels_2d[frame_idx, person]
 
-            IDX = np.argmax(skel_2d[:, 1])
+            # Prefer ankle/toe keypoints for ground contact over the generic lowest pixel
+            foot_kps = skel_2d[FOOT_INDICES]
+            valid_foot = ~np.isnan(foot_kps).any(axis=1)
+            if valid_foot.any():
+                candidates = np.array(FOOT_INDICES)[valid_foot]
+                IDX = candidates[np.argmax(skel_2d[candidates, 1])]
+            else:
+                IDX = np.argmax(skel_2d[:, 1])
             x, y = skel_2d[IDX]
             K = cameras["K"][frame_idx]
             k = cameras["k"][frame_idx]
